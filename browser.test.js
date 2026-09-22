@@ -1,0 +1,148 @@
+/* Run after python build.py and serving dist/ on port 3000.
+   Optional: REAL_GEO=/path/zones.json REAL_XLS=/path/data.xlsx node browser.test.js */
+const { chromium } = require('playwright');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const XLSX = require('./vendor/xlsx.full.min.js');
+const testTile=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
+const vworldPattern=/https:\/\/(?:xdworld|api)\.vworld\.kr\//;
+async function checkBasemaps(browser){
+ const ctx=await browser.newContext(),p=await ctx.newPage(),requests=[],errors=[];
+ let failed=false;
+ await ctx.route(vworldPattern,route=>failed?route.abort():route.fulfill({status:200,contentType:'image/png',body:testTile}));
+ p.on('request',r=>requests.push(r.url()));p.on('pageerror',e=>errors.push(e.message));
+ await p.goto(process.env.TEST_URL||'http://localhost:3000');
+ assert.equal(await p.inputValue('#baseMap'),'vworld');
+ assert.equal(await p.locator('h1').innerText(),'Meatbox_Delivery Zones');
+ assert.ok((await p.title()).startsWith('MFC 권역 작업'));
+ assert.ok(await p.locator('.pagehead p').innerText().then(t=>t==='미트박스 전용차량의 효율을 살리기 위한 권역을 설계해보세요.'));
+ assert.equal(await p.locator('#intro h2').innerText(),'미트박스 최적의 배송 권역을 설계해보세요');
+ assert.equal(await p.locator('#closeIntroBtn').innerText(),'닫기');assert.equal(await p.locator('#demoBtn').count(),0);assert.equal(await p.locator('#intro .footnote').count(),0);
+ const typography=await p.evaluate(()=>({body:parseFloat(getComputedStyle(document.body).fontSize),popup:parseFloat(getComputedStyle(document.querySelector('#intro h2')).fontSize),hint:parseFloat(getComputedStyle(document.querySelector('.hint')).fontSize)}));
+ assert.ok(Math.abs(typography.body-(13+8/3))<.02);assert.ok(Math.abs(typography.popup-(18+8/3))<.02);assert.ok(Math.abs(typography.hint-(11+8/3))<.02);
+ await p.click('#closeIntroBtn');assert.equal(await p.locator('#intro').isVisible(),false);assert.equal(await p.evaluate(()=>agg),null);assert.equal(await p.evaluate(()=>groups.length),0);assert.equal(await p.evaluate(()=>nextWorkerID),0);
+ await p.evaluate(()=>render());assert.equal(await p.locator('#intro').isVisible(),false);
+ await p.waitForFunction(()=>document.querySelector('#baseState').textContent==='VWORLD 일반');
+ assert.ok(requests.some(u=>u.startsWith('https://xdworld.vworld.kr/2d/Base/')));
+ failed=true;await p.selectOption('#baseMap','none');await p.evaluate(()=>{vworldKey='TEST-FAILED-KEY-123456';});await p.selectOption('#baseMap','vworld');
+ await p.waitForSelector('#baseNotice:not(.hidden)');assert.equal(await p.evaluate(()=>tile===null),true);
+ const calls=requests.length;await p.waitForTimeout(500);assert.equal(requests.length,calls);
+ await p.click('#baseNoticeSettings');
+ await p.setInputFiles('#legacyMapInput',{name:'legacy.html',mimeType:'text/html',buffer:Buffer.from("<script>const VDEF='TEST-VWORLD-KEY-123456';window.untrustedExecuted=true;<"+"/script>")});
+ await p.waitForFunction(()=>document.querySelector('#vworldKeyInput').value==='TEST-VWORLD-KEY-123456');
+ assert.equal(await p.evaluate(()=>window.untrustedExecuted),undefined);
+ failed=false;await p.click('#modalAction1');await p.waitForFunction(()=>document.querySelector('#baseState').textContent==='VWORLD 일반');
+ assert.ok(requests.some(u=>u.includes('/req/wmts/1.0.0/TEST-VWORLD-KEY-123456/Base/')));
+ await p.reload();await p.waitForFunction(()=>document.querySelector('#baseState').textContent==='VWORLD 일반');
+ assert.equal(await p.evaluate(()=>vworldKey),'TEST-VWORLD-KEY-123456');
+ await p.click('#baseSettingsBtn');await p.fill('#vworldKeyInput','');await p.click('#modalAction1');
+ assert.equal(await p.evaluate(()=>localStorage.getItem('mfc_vworld_key')),null);
+ await p.selectOption('#baseMap','none');await p.waitForTimeout(100);assert.equal(await p.locator('#baseNotice').isVisible(),false);
+ assert.equal(requests.some(u=>u.includes('tile.openstreetmap.org')),false);assert.deepEqual(errors,[]);
+ await ctx.close();console.log('PASS: mocked VWORLD success/failure/retry, key import, persistence, branding, no OSM fallback.');
+}
+
+(async () => {
+  fs.mkdirSync('.test-output', {recursive:true});
+  const browser = await chromium.launch({headless:true,...(process.env.BROWSER_PATH?{executablePath:process.env.BROWSER_PATH}:{}),args:['--no-sandbox']});
+  try {
+    await checkBasemaps(browser);
+    const context = await browser.newContext({viewport:{width:1440,height:1000},acceptDownloads:true});
+    await context.route(vworldPattern,route=>route.fulfill({status:200,contentType:'image/png',body:testTile}));
+    const page = await context.newPage(), errors=[], outbound=[];
+    page.on('pageerror',e=>errors.push(e.message));
+    page.on('request',r=>{if(r.method()!=='GET')outbound.push({method:r.method(),url:r.url()});});
+    let prompt='테스트 시나리오';page.on('dialog',d=>d.accept(d.type()==='prompt'?prompt:undefined));
+    const idle=()=>page.waitForFunction(()=>document.querySelector('#busy').classList.contains('hidden'),null,{timeout:180000});
+    await page.goto(process.env.TEST_URL || 'http://localhost:3000');
+    await page.screenshot({path:'.test-output/initial.png',fullPage:true});
+    await page.evaluate(()=>demoData());await idle();
+    assert.equal(await page.evaluate(()=>Object.keys(agg.demand).length),41);
+    await page.click('#runBtn');await idle();
+    assert.equal(await page.evaluate(()=>diagnostics.unassigned.length),0);
+    const original=await page.evaluate(()=>JSON.stringify(groups));
+    await page.click('[data-action="lock"][data-i="0"]');
+    const locked=await page.evaluate(()=>JSON.stringify(groups[0]));
+    await page.click('#runBtn');await idle();
+    assert.equal(await page.evaluate(()=>JSON.stringify(groups[0])),locked);
+    await page.click('#undoBtn');
+    await page.click('[data-action="lock"][data-i="0"]');
+    await page.click('[data-action="edit"][data-i="0"]');
+    const z=await page.evaluate(()=>groups.slice(1).flatMap(g=>g.zips).find(z=>E.riverCompatible([...groups[0].zips,z],geo.zones)));assert.ok(z);
+    await page.fill('#editZips',z);await page.click('#addZipsBtn');
+    assert.equal(await page.evaluate(z=>groups.filter(g=>g.zips.includes(z)).length,z),1);
+    assert.equal(await page.evaluate(z=>groups[0].zips.includes(z),z),true);
+    await page.click('#undoBtn');
+    assert.equal(await page.evaluate(()=>JSON.stringify(groups)),original);
+    await page.click('[data-action="detail"][data-i="0"]');
+    await page.fill('#renameInput','<img src=x onerror=alert(1)>');await page.click('#modalAction1');
+    assert.equal(await page.locator('#groupList img').count(),0);
+    await page.click('#undoBtn');
+    await page.click('[data-filter="valid"]');assert.equal(await page.locator('[data-group]').count(),await page.evaluate(()=>diagnostics.valid));await page.click('[data-filter="all"]');
+    await page.locator('[data-group="0"]').hover();assert.ok(await page.locator('#selectedSummary').innerText().then(s=>s.includes('최대일')&&s.includes('kg')));
+    const priorBasis=await page.inputValue('#basis'),priorAvg=await page.evaluate(()=>agg.avgBox);
+    await page.selectOption('#displayMode','sum');assert.equal(await page.inputValue('#basis'),priorBasis);assert.ok(await page.locator('#boxLabel').innerText().then(s=>s.includes('합계')));await page.selectOption('#displayMode','avg');
+    await page.click('#scopeBtn');await page.locator('[data-city-index="0"]').check();await page.click('#modalAction2');assert.equal(await page.evaluate(()=>operationScope.size),48);
+    await page.click('#fillEmptyBtn');await idle();assert.ok(await page.evaluate(()=>groups.flatMap(g=>g.zips).some(z=>!agg.demand[z])));assert.equal(await page.evaluate(()=>agg.avgBox),priorAvg);
+    assert.equal(await page.evaluate(()=>{const z=groups.flatMap(g=>g.zips).find(z=>!agg.demand[z]);return style(z).fillOpacity<.4}),true);
+    await page.click('[data-action="edit"][data-i="0"]');const core=await page.evaluate(()=>groups[0].zips[0]);await page.fill('#editZips',core);await page.click('#coreBtn');await page.click('#removeZipsBtn');assert.equal(await page.evaluate(z=>groups[0].zips.includes(z),core),true);await page.click('#endEditBtn');
+    const preserved=await page.evaluate(()=>JSON.stringify(groups));await page.click('#runBtn');await idle();assert.equal(await page.evaluate(()=>JSON.stringify(groups)),preserved);
+    await page.fill('#vehicleCap','1400');await page.check('#weightOn');await page.selectOption('#planPolicy','rebuild');await page.click('#runBtn');await idle();assert.equal(await page.evaluate(z=>groups[0].core.includes(z),core),true);await page.uncheck('#weightOn');
+    await page.click('#snapshotBtn');
+    assert.equal(await page.evaluate(()=>scenarios.length),1);
+    await page.selectOption('#basis','peak');await page.click('#runBtn');await idle();
+    prompt='최대 기준';await page.click('#snapshotBtn');await page.click('#compareTab');
+    assert.equal(await page.locator('[data-restore]').count(),2);
+    await page.click('[data-restore="0"]');await idle();
+    assert.equal(await page.inputValue('#basis'),'avg');
+    await page.click('#calendarBtn');await page.click('[data-day-preset="none"]');await page.click('[data-day="2026-09-02"]');await page.click('#modalAction0');await idle();
+    assert.deepEqual(await page.evaluate(()=>agg.dates),['2026-09-02']);
+    const planEvent=page.waitForEvent('download');await page.click('#savePlanBtn');const plan=await planEvent;await plan.saveAs('.test-output/plan.json');
+    const saved=JSON.parse(fs.readFileSync('.test-output/plan.json','utf8'));assert.equal(saved.version,3);assert.ok(!('records' in saved));
+    await page.click('#newGroupBtn');await page.setInputFiles('#planInput','.test-output/plan.json');await idle();
+    assert.equal(await page.evaluate(()=>groups.length),saved.groups.length);
+    const exportEvent=page.waitForEvent('download');await page.click('#exportBtn');const out=await exportEvent;await out.saveAs('.test-output/export.xlsx');await idle();
+    const wb=XLSX.read(fs.readFileSync('.test-output/export.xlsx'),{type:'buffer'});assert.deepEqual(wb.SheetNames,['권역요약','우편번호배정','일별부하','데이터오류','설정']);
+    assert.equal(XLSX.utils.sheet_to_json(wb.Sheets['우편번호배정']).length,48);
+    await page.screenshot({path:'.test-output/demo.png',fullPage:true});
+    await page.setViewportSize({width:390,height:844});await page.screenshot({path:'.test-output/mobile.png',fullPage:true});
+    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1));
+    await page.setViewportSize({width:1440,height:1000});
+    if (process.env.REAL_GEO && process.env.REAL_XLS) {
+      await page.setInputFiles('#geoInput',process.env.REAL_GEO);await idle();
+      assert.equal(await page.evaluate(()=>Object.keys(geo.zones).length),19577);
+      // Binary payload avoids headless file chooser quirks with long Unicode paths.
+      await page.setInputFiles('#xlsInput',{name:'rawdata.xlsx',mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',buffer:fs.readFileSync(process.env.REAL_XLS)});await idle();
+      assert.equal(await page.inputValue('#col_date'),'배송종료일자');
+      await page.click('#modalAction0');await idle();
+      assert.equal(await page.evaluate(()=>meta.totalRows),183753);
+      assert.equal(await page.evaluate(()=>agg.totalBox),139233);
+      assert.equal(await page.evaluate(()=>meta.errors.length),55487);
+      await page.click('#runBtn');await idle();
+      const result=await page.evaluate(()=>({groups:groups.length,valid:diagnostics.valid,unassigned:diagnostics.unassigned.length,over:diagnostics.over}));
+      assert.equal(result.unassigned,0);assert.equal(await page.evaluate(()=>diagnostics.groups.some(s=>s.issues.includes('강남·강북 혼합'))),false);
+      const invariants=await page.evaluate(()=>{const c=config();return diagnostics.groups.every((s,i)=>s.diameter<=s.allowedDiameter+1e-8&&(groups[i].zips.length===1||(s.box<=c.maxBox+1e-8&&s.stop<=c.targetStop+c.tolerance+1e-8)));});assert.equal(invariants,true);
+      console.log('REAL_DATA_BROWSER',JSON.stringify(result));
+      await page.click('#auditBtn');assert.ok(await page.locator('#modalRoot').innerText().then(t=>t.includes('55,487')));await page.click('#closeModal');
+      await page.screenshot({path:'.test-output/real.png',fullPage:true});
+    }
+    assert.deepEqual(errors,[]);assert.deepEqual(outbound,[]);
+    // No network access is needed to execute the exported single-file version.
+    const offline=await browser.newContext({offline:true});const local=await offline.newPage();local.on('dialog',d=>d.accept());
+    await local.goto('file://'+process.cwd()+'/dist/MFC_Delivery_Zones_3.2.html');
+    await local.selectOption('#baseMap','none');await local.click('#closeIntroBtn');assert.equal(await local.evaluate(()=>agg),null);await local.evaluate(()=>demoData());
+    await local.waitForFunction(()=>document.querySelector('#busy').classList.contains('hidden'));
+    await local.click('#runBtn');await local.waitForFunction(()=>document.querySelector('#busy').classList.contains('hidden'));
+    assert.equal(await local.evaluate(()=>diagnostics.unassigned.length),0);
+    const small=XLSX.utils.book_new();XLSX.utils.book_append_sheet(small,XLSX.utils.aoa_to_sheet([['권역','받는사람','배송지주소','우편번호','배송종료일자','수량','중량(kg)'],['가상','A','가상로 1','10001',20260901,2,120],['가상','A','가상로 1','10001',20260901,3,230]]),'Sheet1');
+    const payload=Buffer.from(XLSX.write(small,{type:'array',bookType:'xlsx'}));
+    const before=await local.evaluate(()=>JSON.stringify(groups));
+    await local.setInputFiles('#xlsInput',{name:'weight.xlsx',mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',buffer:payload});await local.waitForSelector('#col_weight');assert.equal(await local.inputValue('#col_weight'),'중량(kg)');
+    await local.click('#modalAction0');await local.waitForFunction(()=>document.querySelector('#busy').classList.contains('hidden'));
+    assert.equal(await local.evaluate(()=>agg.knownWeight),350);assert.equal(await local.evaluate(()=>agg.avgStop),1);assert.equal(await local.evaluate(()=>JSON.stringify(groups)),before);
+    await local.check('#weightOn');await local.click('#runBtn');await local.waitForFunction(()=>document.querySelector('#busy').classList.contains('hidden'));assert.ok(await local.locator('#status').textContent().then(s=>s.includes('적재한도')));
+
+    await offline.close();
+    console.log('PASS: imports, optimizer, locks, editing, undo, XSS escaping, comparison, dates, save/load, XLSX export, mobile, offline.');
+  } finally {await browser.close();}
+})().catch(e=>{console.error(e);process.exit(1);});
