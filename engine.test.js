@@ -115,10 +115,47 @@ test('preserved responsibility remains fixed even on days with zero demand',()=>
 });
 test('necessary feasibility bounds warn when boxes and stop targets cannot coexist',()=>{
  const bounds=e.feasibility({avgBox:5355.1,avgStop:2554.6,dates:agg.dates},{...c,minBox:60,maxBox:75,targetStop:15,tolerance:5});
- assert.deepEqual(bounds,{lower:128,upper:89,conflict:true});assert.equal(e.feasibility(agg,{...c,basis:'peak'}),null);
+ assert.deepEqual(bounds,{lower:128,upper:89,conflict:true,vehicles:null,vehicleShort:false});assert.equal(e.feasibility({avgBox:5355.1,avgStop:2554.6,dates:agg.dates},{...c,minBox:60,maxBox:75,targetStop:15,tolerance:5,vehicleCount:56}).vehicleShort,true);assert.equal(e.feasibility(agg,{...c,basis:'peak'}),null);
 });
 test('mixed density group union respects strictest member diameter for all pairs',()=>{
  const features=[],demand={};for(let i=0;i<60;i++){const z=String(20000+i);features.push(polygon(z,127+(i%10)*.009,37+Math.floor(i/10)*.012));demand[z]={boxes:[1,1],stops:[.1,.1]};}
  const geo=e.geometry({type:'FeatureCollection',features}),a={dates:agg.dates,demand},cfg={...c,density:true,link:'near',gap:4,diameter:6};const groups=e.optimize(geo.zones,geo.adjacency,a,cfg),ds=e.diagnose(groups,geo,a,cfg);
  assert.ok(ds.groups.every(g=>g.diameter<=g.allowedDiameter+1e-8));
+});
+
+test('vehicle codes normalise Z-1 / z001 forms and channel keywords classify OLS versus dedicated',()=>{
+  assert.equal(e.vehicleCode('Z001'),'Z001');assert.equal(e.vehicleCode(' z-7 '),'Z007');assert.equal(e.vehicleCode('Z56'),'Z056');assert.equal(e.vehicleCode('1234'),'');assert.equal(e.vehicleCode('ZZZZ1'),'');
+  assert.equal(e.channel('OLS'),'ols');assert.equal(e.channel('공동배송'),'ols');assert.equal(e.channel('전용차'),'own');assert.equal(e.channel('Z012'),'own');assert.equal(e.channel('',''),'');assert.equal(e.channel('','Z012'),'own');assert.equal(e.channel('기타'),'other');
+  assert.deepEqual(e.vehiclePool({}).slice(0,2),['Z001','Z002']);assert.equal(e.vehiclePool({}).length,56);assert.equal(e.vehiclePool({}).at(-1),'Z056');assert.deepEqual(e.vehiclePool({vehiclePrefix:'A',vehicleCount:2,vehicleStart:5}),['A005','A006']);
+});
+test('OLS rows are aggregated separately and never enter dedicated demand',()=>{
+  const mapping={date:'d',zip:'z',box:'b',address:'a',recv:'r',channel:'k',vehicle:'v'},rows=[
+    {d:20260901,z:1001,b:2,a:'주소 1',r:'A',k:'전용',v:'Z001'},{d:20260901,z:1002,b:3,a:'주소 2',r:'B',k:'OLS',v:''},
+    {d:20260902,z:1001,b:4,a:'주소 1',r:'A',k:'',v:'Z002'},{d:20260902,z:1001,b:5,a:'주소 3',r:'C',k:'',v:'Z001'},{d:20260902,z:1003,b:1,a:'주소 4',r:'D',k:'공동배송',v:''}];
+  const d=e.ingest(rows,mapping,makeGeo().zones,'recipient');
+  assert.equal(d.hasChannel,true);assert.equal(d.hasVehicle,true);assert.deepEqual(d.channels,{own:3,ols:2,other:0,unknown:0});assert.deepEqual(d.vehicleCodes,['Z001','Z002']);
+  const a=e.aggregate(d,['2026-09-01','2026-09-02']);
+  assert.deepEqual(Object.keys(a.demand),['01001']);assert.deepEqual(Object.keys(a.ols).sort(),['01002','01003']);
+  assert.equal(a.totalBox,11);assert.equal(a.olsTotalBox,4);assert.equal(a.olsRows,2);assert.equal(a.olsAvgStop,1);
+  assert.equal(a.currentVehicle['01001'].code,'Z001');assert.ok(Math.abs(a.currentVehicle['01001'].share-7/11)<1e-9);assert.equal(a.currentVehicle['01001'].codes,2);
+  const merged=e.mergedDemand(a);assert.equal(merged['01002'].avgBox,1.5);assert.equal(merged['01001'].avgBox,5.5);
+  const cur=e.currentGroups(a,{});assert.deepEqual(cur,[{name:'Z001',code:'Z001',kind:'own',zips:['01001'],core:[],locked:false}]);
+});
+test('vehicle assignment keeps valid codes, inherits dominant current codes, fills from pool and reports shortage',()=>{
+  const cfg={...c,vehicleCount:3},aggV={vehicles:{'01001':{Z002:10},'01002':{Z002:1,Z003:20},'01003':{X001:5}}};
+  const groups=[{zips:['01001'],code:'Z001',kind:'own'},{zips:['01002'],code:'',kind:'own'},{zips:['01003'],code:'Z099',kind:'own'},{zips:['01004'],kind:'ols',code:''},{zips:[],kind:'own',code:''}];
+  const r=e.assignVehicles(groups,cfg,aggV);
+  assert.equal(r.groups[0].code,'Z001');assert.equal(r.groups[1].code,'Z003');assert.equal(r.groups[2].code,'Z002');assert.equal(r.groups[3].code,'');assert.equal(r.groups[4].code,'');assert.equal(r.shortage,1);assert.deepEqual(r.free,[]);
+  const re=e.assignVehicles([{zips:['01001'],code:'Z003',kind:'own',locked:true},{zips:['01002'],code:'Z003',kind:'own'}],cfg,{vehicles:{}},{reassign:true});
+  assert.equal(re.groups[0].code,'Z003');assert.equal(re.groups[1].code,'Z001');
+});
+test('diagnose treats OLS groups as informational and flags dedicated vehicle code problems',()=>{
+  const geo=makeGeo(),cfg={...c,vehicleCount:2},a={...agg,ols:{'01004':{z:'01004',boxes:[6,6],stops:[1,1],weights:[0,0],avgBox:6,avgStop:1}},excludedZips:[]};
+  const groups=[{name:'A',zips:['01001','01002'],code:'Z001',kind:'own'},{name:'B',zips:['01003'],code:'Z001',kind:'own'},{name:'C',zips:['01004'],code:'',kind:'own'},{name:'OLS',zips:['01004'],kind:'ols'}];
+  const d=e.diagnose(groups,geo,a,cfg);
+  assert.ok(d.groups[0].issues.includes('차량코드 중복'));assert.ok(d.groups[1].issues.includes('차량코드 중복'));assert.ok(d.groups[2].issues.includes('차량코드 미배정'));
+  assert.equal(d.groups[3].kind,'ols');assert.ok(d.groups[3].issues.includes('중복 배정'));assert.equal(d.groups[3].avgBox,26);assert.equal(d.own,3);assert.equal(d.olsGroups,1);assert.equal(d.vehicleShortage,1);
+  const clean=e.diagnose([{name:'OLS',zips:['01004'],kind:'ols'}],geo,{...a,demand:{'01001':agg.demand['01001']}},cfg);
+  assert.equal(clean.groups[0].valid,true);assert.deepEqual(clean.olsOnly,[]);assert.deepEqual(clean.unassigned,['01001']);
+  assert.throws(()=>e.validate({...cfg,vehicleCount:-1}));assert.throws(()=>e.validate({...cfg,vehiclePrefix:'1'}));
 });

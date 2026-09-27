@@ -20,5 +20,5 @@ for src, local, element_id in [
 assert '<script src=' not in html
 (ROOT / 'dist').mkdir(exist_ok=True)
 (ROOT / 'dist/index.html').write_text(html)
-(ROOT / 'dist/MFC_Delivery_Zones_3.2.html').write_text(html)
+(ROOT / 'dist/MFC_Delivery_Zones_3.4.html').write_text(html)
 print(f'Built standalone HTML: {len(html.encode()):,} bytes; no uploaded customer data included.')

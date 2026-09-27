@@ -30,6 +30,23 @@ function createEngine() {
     return !sides.has('unknown')&&!(sides.has('north')&&sides.has('south'));
   }
   const weightCap=c=>Math.min(c.maxWeight??Infinity,c.vehicleCap??Infinity);
+  // 3.4 delivery channel: dedicated vehicles (Z001~Z056 by default) versus OLS shared delivery.
+  const OLS_RE=/\bOLS\b|공동|합배|택배|외주|(?<!전)용차|위탁/i, OWN_RE=/전용|자차|고정|직배|MFC/i;
+  function vehicleCode(value){
+    const s=normal(value).toUpperCase().replace(/\s+/g,'');
+    const m=s.match(/^([A-Z]{1,3})-?(\d{1,3})$/);
+    return m?m[1]+m[2].padStart(3,'0'):'';
+  }
+  function channel(value,vehicle){
+    const s=normal(value);
+    if(s){ if(OLS_RE.test(s))return 'ols'; if(OWN_RE.test(s)||vehicleCode(s))return 'own'; return 'other'; }
+    if(vehicle)return 'own';
+    return '';
+  }
+  function vehiclePool(c){
+    const prefix=String(c?.vehiclePrefix||'Z').toUpperCase(), count=Number.isFinite(+c?.vehicleCount)?Math.max(0,Math.floor(+c.vehicleCount)):56, start=Number.isFinite(+c?.vehicleStart)?Math.max(1,Math.floor(+c.vehicleStart)):1;
+    return Array.from({length:count},(_,i)=>prefix+String(start+i).padStart(3,'0'));
+  }
 
   const zip = value => {
     const s = String(value == null ? '' : value).trim();
@@ -98,7 +115,8 @@ function createEngine() {
   }
   function ingest(rows, mapping, zones, mode, corrections = {}) {
     const records = [], errors = [], weightErrors = [], daily = {}, conflicts = new Map();
-    const hasWeight=!!mapping.weight;
+    const hasWeight=!!mapping.weight, hasChannel=!!mapping.channel, hasVehicle=!!mapping.vehicle;
+    const channels={own:0,ols:0,other:0,unknown:0}, vehicleCodes=new Set();
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i], d = date(r[mapping.date]);
       const raw = r[mapping.box], b = typeof raw === 'number' ? raw : Number(String(raw == null ? '' : raw).replace(/,/g, '').trim());
@@ -109,6 +127,7 @@ function createEngine() {
       const original = normal(r[mapping.zip]), z = zip(corrections[original] || original);
       let reason = !d ? '날짜 오류' : raw === '' || raw == null || !Number.isFinite(b) || b <= 0 ? '수량 오류 (양수 필요)' : !address ? '주소 누락' : !z ? '우편번호 형식' : !zones[z] ? '경계 없음' : '';
       const sk = stopKey(recv, address, mode);
+      const v=hasVehicle?vehicleCode(r[mapping.vehicle]):'', k=hasChannel||hasVehicle?channel(hasChannel?r[mapping.channel]:'',v):'';
       if (z && address) { if (!conflicts.has(sk)) conflicts.set(sk, new Set()); conflicts.get(sk).add(z); }
       if (reason) errors.push({ row: i + 2, date: d, zip: original, box: Number.isFinite(b) ? b : 0, reason });
       // Keep date-valid rows for selected-period auditing, including rejected deliveries.
@@ -116,33 +135,61 @@ function createEngine() {
         daily[d] ||= { rows: 0, boxes: 0, rejected: 0 };
         daily[d].rows++; daily[d].boxes += Number.isFinite(b) && b > 0 ? b : 0;
         if (reason) daily[d].rejected++;
-        records.push({ d, z, b, w, sk: z + '|' + sk, reason });
+        if(!reason){channels[k||'unknown']++;if(v)vehicleCodes.add(v);}
+        records.push({ d, z, b, w, sk: z + '|' + sk, reason, k, v });
       }
     }
-    return { records, errors, weightErrors, hasWeight, daily, conflictCount: [...conflicts.values()].filter(s => s.size > 1).length, totalRows: rows.length, mode };
+    return { records, errors, weightErrors, hasWeight, hasChannel, hasVehicle, channels, vehicleCodes:[...vehicleCodes].sort(), daily, conflictCount: [...conflicts.values()].filter(s => s.size > 1).length, totalRows: rows.length, mode };
   }
   function aggregate(data, days) {
     const dates = [...new Set(days)].sort(), sel = new Map(dates.map((d, i) => [d, i])), n = dates.length;
     if (!n) throw Error('배송일을 한 개 이상 선택하세요.');
-    const demand = {}, stops = new Set(), excludedZips = new Set();
-    let rejectedRows = 0, rejectedBoxes = 0, acceptedRows = 0;
+    const demand = {}, ols = {}, vehicles = {}, stops = new Set(), olsStops = new Set(), excludedZips = new Set();
+    let rejectedRows = 0, rejectedBoxes = 0, acceptedRows = 0, olsRows = 0;
     for (const r of data.records) {
       if (!sel.has(r.d)) continue;
       if (r.reason) { rejectedRows++; rejectedBoxes += r.b > 0 ? r.b : 0;if(r.z)excludedZips.add(r.z); continue; }
       acceptedRows++;
-      const v = demand[r.z] ||= { z: r.z, boxes: Array(n).fill(0), stops: Array(n).fill(0), weights:Array(n).fill(0), unknownWeight:Array(n).fill(0) }, i = sel.get(r.d);
-      v.boxes[i] += r.b;
+      const i = sel.get(r.d);
+      // OLS rows are shared delivery: tracked per zip, never counted as dedicated-vehicle load.
+      if (r.k === 'ols') {
+        olsRows++;
+        const o = ols[r.z] ||= { z: r.z, boxes: Array(n).fill(0), stops: Array(n).fill(0), weights: Array(n).fill(0) };
+        o.boxes[i] += r.b; if (r.w != null) o.weights[i] += r.w;
+        const ok = r.d + '|' + r.sk; if (!olsStops.has(ok)) { olsStops.add(ok); o.stops[i]++; }
+        continue;
+      }
+      const v = demand[r.z] ||= { z: r.z, boxes: Array(n).fill(0), stops: Array(n).fill(0), weights:Array(n).fill(0), unknownWeight:Array(n).fill(0), channels:{own:0,other:0,unknown:0} };
+      v.boxes[i] += r.b; v.channels[r.k||'unknown']++;
+      if (r.v) { (vehicles[r.z] ||= {})[r.v] = (vehicles[r.z][r.v] || 0) + r.b; }
       if(r.w===null||r.w===undefined)v.unknownWeight[i]++;else v.weights[i]+=r.w;
       const k = r.d + '|' + r.sk;
       if (!stops.has(k)) { stops.add(k); v.stops[i]++; }
     }
     for (const v of Object.values(demand)) { v.avgBox = sum(v.boxes) / n; v.avgStop = sum(v.stops) / n; v.avgWeight=data.hasWeight&&!sum(v.unknownWeight)?sum(v.weights)/n:null; }
-    return { demand, dates, excludedZips:[...excludedZips], acceptedRows, rejectedRows, rejectedBoxes, hasWeight:!!data.hasWeight, unknownWeight:sum(Object.values(demand).map(v=>sum(v.unknownWeight))), knownWeight:sum(Object.values(demand).map(v=>sum(v.weights))), totalBox: sum(Object.values(demand).map(v => sum(v.boxes))), avgBox: sum(Object.values(demand).map(v => v.avgBox)), avgStop: stops.size / n, mode: data.mode };
+    for (const o of Object.values(ols)) { o.avgBox = sum(o.boxes) / n; o.avgStop = sum(o.stops) / n; }
+    // Dominant current vehicle per zip, decided by box share so a stray code cannot flip the owner.
+    const currentVehicle = Object.fromEntries(Object.entries(vehicles).map(([z, codes]) => { const total = sum(Object.values(codes)); const [code, boxes] = Object.entries(codes).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]; return [z, { code, share: boxes / total, codes: Object.keys(codes).length }]; }));
+    return { demand, ols, vehicles, currentVehicle, dates, excludedZips:[...excludedZips], acceptedRows, rejectedRows, rejectedBoxes, olsRows, hasChannel:!!data.hasChannel, hasVehicle:!!data.hasVehicle, hasWeight:!!data.hasWeight, unknownWeight:sum(Object.values(demand).map(v=>sum(v.unknownWeight))), knownWeight:sum(Object.values(demand).map(v=>sum(v.weights))), totalBox: sum(Object.values(demand).map(v => sum(v.boxes))), avgBox: sum(Object.values(demand).map(v => v.avgBox)), avgStop: stops.size / n, olsTotalBox: sum(Object.values(ols).map(o => sum(o.boxes))), olsAvgBox: sum(Object.values(ols).map(o => o.avgBox)), olsAvgStop: olsStops.size / n, mode: data.mode };
+  }
+  // Demand view that also carries OLS volume, used only to report OLS zones.
+  function mergedDemand(agg) {
+    const out = { ...agg.demand };
+    for (const [z, o] of Object.entries(agg.ols || {})) {
+      const d = out[z];
+      out[z] = d ? { ...d, boxes: d.boxes.map((b, i) => b + o.boxes[i]), stops: d.stops.map((s, i) => s + o.stops[i]), avgBox: d.avgBox + o.avgBox, avgStop: d.avgStop + o.avgStop } : { ...o, weights: o.weights, unknownWeight: o.boxes.map(() => 0), avgWeight: null };
+    }
+    return out;
   }
   function validate(c) {
     for (const k of ['minBox', 'maxBox', 'targetStop', 'tolerance', 'diameter', 'gap']) if (!Number.isFinite(c[k])) throw Error('모든 조건을 숫자로 입력해 주세요.');
     if (c.minBox < 0 || c.maxBox <= 0 || c.minBox > c.maxBox || c.targetStop <= 0 || c.tolerance < 0 || c.diameter <= 0 || c.gap <= 0) throw Error('박스 범위·착지·거리 조건을 확인하세요.');
     if (!['avg', 'peak'].includes(c.basis) || !['near', 'strict'].includes(c.link)) throw Error('알 수 없는 최적화 기준입니다.');
+    if(c.vehicleCount!==undefined){
+      if(!Number.isInteger(+c.vehicleCount)||+c.vehicleCount<0||+c.vehicleCount>999)throw Error('전용차 대수는 0~999 사이 정수로 입력하세요.');
+      if(c.vehiclePrefix!==undefined&&!/^[A-Za-z]{1,3}$/.test(String(c.vehiclePrefix)))throw Error('차량코드 접두어는 영문 1~3자입니다 (예: Z).');
+      if(c.vehicleStart!==undefined&&(!Number.isInteger(+c.vehicleStart)||+c.vehicleStart<1))throw Error('차량코드 시작 번호는 1 이상 정수입니다.');
+    }
     if(c.weightOn) {
       for(const k of ['minWeight','maxWeight','vehicleCap'])if(!Number.isFinite(c[k]))throw Error('중량 조건을 숫자로 입력하세요.');
       if(c.minWeight<0||c.maxWeight<=0||c.minWeight>c.maxWeight||c.vehicleCap<=0)throw Error('중량 범위와 실제 차량 적재한도를 확인하세요.');
@@ -264,13 +311,31 @@ function createEngine() {
     return [...locked, ...best.map(a => {
       const region = zones[a.zips[0]].region, short = region.replace(/특별자치|특별|광역|도|시/g, '') || '권역';
       sequence[short] = (sequence[short] || 0) + 1;
-      return { name: short + '-' + String(sequence[short]).padStart(2, '0'), zips: a.zips, core:[], locked: false };
+      return { name: short + '-' + String(sequence[short]).padStart(2, '0'), zips: a.zips, core:[], locked: false, kind:'own', code:'' };
     })];
   }
   function diagnose(groups, geo, agg, c) {
-    const g = graph(geo.zones, geo.adjacency, agg.demand, c);
+    const g = graph(geo.zones, geo.adjacency, agg.demand, c), merged = mergedDemand(agg), pool = new Set(vehiclePool(c)), codes = new Map();
+    groups.forEach(a => { if (a.kind !== 'ols' && a.code) codes.set(a.code, (codes.get(a.code) || 0) + 1); });
     const owners = new Set(), result = groups.map(a => {
+      if (a.kind === 'ols') {
+        // Shared delivery: volume is informational; no vehicle capacity or contiguity rules apply.
+        const s = stats(a.zips, merged, agg.dates, geo.zones, c), issues = [];
+        s.olsBox = sum(a.zips.map(z => agg.ols?.[z] ? sum(agg.ols[z].boxes) : 0)) / Math.max(1, agg.dates.length);
+        s.ownBox = sum(a.zips.map(z => agg.demand[z]?.avgBox || 0));
+        s.allowedDiameter = Infinity; s.overDays = 0; s.empty = a.zips.filter(z => !agg.demand[z] && !agg.ols?.[z]).length;
+        if (a.zips.some(z => !geo.zones[z])) issues.push('경계 없음');
+        if (a.zips.some(z => owners.has(z))) issues.push('중복 배정');
+        if (a.zips.some(z => agg.excludedZips?.includes(z))) issues.push('제외 데이터 확인');
+        a.zips.forEach(z => owners.add(z));
+        return { ...s, kind: 'ols', issues, valid: !issues.length };
+      }
       const s = stats(a.zips, agg.demand, agg.dates, geo.zones, c), issues = [], active = a.zips.filter(z => agg.demand[z]);
+      s.kind = 'own'; s.olsBox = sum(a.zips.map(z => agg.ols?.[z] ? sum(agg.ols[z].boxes) : 0)) / Math.max(1, agg.dates.length);
+      if (c.vehicleCount !== undefined) {
+        if (!a.code) issues.push('차량코드 미배정');
+        else { if (!pool.has(a.code)) issues.push('차량코드 범위 밖'); if (codes.get(a.code) > 1) issues.push('차량코드 중복'); }
+      }
       if (s.box > c.maxBox + 1e-8) issues.push('박스 초과');
       if (s.stop > c.targetStop + c.tolerance + 1e-8) issues.push('착지 초과');
       if (s.box < c.minBox - 1e-8) issues.push('박스 미달');
@@ -292,7 +357,29 @@ function createEngine() {
       if (!connected(a.zips, strict)) s.proximity = true;
       return { ...s, issues, valid: !issues.length };
     });
-    return { groups: result, unassigned: Object.keys(agg.demand).filter(z => !owners.has(z)), valid: result.filter(s => s.valid).length, over: result.filter(s => s.issues.some(x => /초과/.test(x))).length };
+    const own = groups.filter(a => a.kind !== 'ols').length, olsGroups = groups.length - own;
+    const olsOnly = Object.keys(agg.ols || {}).filter(z => !agg.demand[z] && !owners.has(z));
+    return { groups: result, unassigned: Object.keys(agg.demand).filter(z => !owners.has(z)), olsOnly, own, olsGroups, vehicleCount: c.vehicleCount === undefined ? null : +c.vehicleCount, vehicleShortage: c.vehicleCount === undefined ? 0 : Math.max(0, own - +c.vehicleCount), valid: result.filter(s => s.valid).length, over: result.filter(s => s.issues.some(x => /초과/.test(x))).length };
+  }
+  // Assign dedicated vehicle codes: keep valid existing codes, inherit the dominant current code, then fill from the pool in order.
+  function assignVehicles(groups, c, agg, options = {}) {
+    const pool = vehiclePool(c), poolSet = new Set(pool), used = new Set(), out = groups.map(g => ({ ...g }));
+    const own = out.filter(g => g.kind !== 'ols');
+    for (const g of own) { if (g.code && poolSet.has(g.code) && !used.has(g.code) && (options.keepAll || g.locked || g.core?.length || !options.reassign)) used.add(g.code); else if (options.reassign && !(g.locked || g.core?.length)) g.code = ''; else if (g.code && (!poolSet.has(g.code) || used.has(g.code))) g.code = ''; }
+    const pending = own.filter(g => !g.code);
+    // Inherit the current code carrying most boxes inside the group when it is still free.
+    const wish = pending.map(g => { const tally = {}; for (const z of g.zips) for (const [code, boxes] of Object.entries(agg?.vehicles?.[z] || {})) tally[code] = (tally[code] || 0) + boxes; const best = Object.entries(tally).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]; return { g, code: best?.[0] || '', boxes: best?.[1] || 0 }; }).sort((a, b) => b.boxes - a.boxes);
+    for (const w of wish) if (w.code && poolSet.has(w.code) && !used.has(w.code)) { w.g.code = w.code; used.add(w.code); }
+    let cursor = 0, shortage = 0;
+    for (const g of pending) { if (g.code) continue; while (cursor < pool.length && used.has(pool[cursor])) cursor++; if (cursor < pool.length) { g.code = pool[cursor]; used.add(pool[cursor]); cursor++; } else shortage++; }
+    return { groups: out, shortage, free: pool.filter(code => !used.has(code)) };
+  }
+  // Rebuild the current fleet assignment from vehicle codes found in the raw data.
+  function currentGroups(agg, c) {
+    const byCode = {}, pool = vehiclePool(c);
+    for (const [z, v] of Object.entries(agg.currentVehicle || {})) (byCode[v.code] ||= []).push(z);
+    const order = Object.keys(byCode).sort((a, b) => (pool.indexOf(a) + 1 || 1e6) - (pool.indexOf(b) + 1 || 1e6) || a.localeCompare(b));
+    return order.map(code => ({ name: code, code, kind: 'own', zips: byCode[code].sort(), core: [], locked: false }));
   }
   function feasibility(agg,c) {
     // Necessary average-load bounds only, not a routing optimum or sufficient condition.
@@ -301,18 +388,20 @@ function createEngine() {
     let lower=Math.max(Math.ceil((agg.avgBox-1e-8)/c.maxBox),Math.ceil((agg.avgStop-1e-8)/maxStop));
     let upper=Math.min(c.minBox>0?Math.floor((agg.avgBox+1e-8)/c.minBox):Infinity,minStop>0?Math.floor((agg.avgStop+1e-8)/minStop):Infinity);
     if(c.weightOn&&agg.hasWeight&&!agg.unknownWeight){const w=agg.knownWeight/agg.dates.length;lower=Math.max(lower,Math.ceil((w-1e-8)/Math.min(c.maxWeight,c.vehicleCap)));if(c.minWeight>0)upper=Math.min(upper,Math.floor((w+1e-8)/c.minWeight));}
-    return {lower:Math.max(0,lower),upper,conflict:lower>upper};
+    const vehicles=c.vehicleCount===undefined?null:+c.vehicleCount;
+    return {lower:Math.max(0,lower),upper,conflict:lower>upper,vehicles,vehicleShort:vehicles!==null&&lower>vehicles};
   }
   function fillEmpty(groups,geo,agg,c,scope) {
     if(!Array.isArray(scope)||!scope.length)throw Error('운영지역을 먼저 명시적으로 선택하세요.');
     const out=groups.map(g=>({...g,zips:[...g.zips]})),owner=new Map(),allowed=new Set(scope),queue=[];
     const excluded=new Set(agg.excludedZips||[]), graphLimits=graph(geo.zones,geo.adjacency,agg.demand,c).limits;
-    out.forEach((g,i)=>g.zips.forEach(z=>{owner.set(z,i);if(!g.locked&&allowed.has(z))queue.push([z,i]);}));
+    out.forEach((g,i)=>g.zips.forEach(z=>{owner.set(z,i);if(!g.locked&&g.kind!=='ols'&&allowed.has(z))queue.push([z,i]);}));
     let added=0;
     for(let k=0;k<queue.length;k++){
       const [z,i]=queue[k],group=out[i];
       for(const b of geo.adjacency[z]||[]){
-        if(!allowed.has(b)||owner.has(b)||agg.demand[b]||excluded.has(b))continue;
+        // OLS-only zones carry shared-delivery volume; they are not empty and stay out of dedicated fill.
+        if(!allowed.has(b)||owner.has(b)||agg.demand[b]||agg.ols?.[b]||excluded.has(b))continue;
         if(c.han&&!riverCompatible([...group.zips,b],geo.zones))continue;
         if(c.sameRegion&&group.zips.some(a=>geo.zones[a].region!==geo.zones[b].region))continue;
         const maxDiameter=Math.min(c.diameter,...group.zips.map(a=>graphLimits[a]?.diameter||c.diameter));
@@ -322,7 +411,7 @@ function createEngine() {
     }
     return {groups:out,added,remaining:scope.filter(z=>!owner.has(z)&&!agg.demand[z])};
   }
-  return { zip, date, distance, stopKey, geometry, ingest, aggregate, validate, graph, connected, stats, optimize, diagnose, fillEmpty, feasibility, hanLine, hanSource, riverCompatible, inPolygon };
+  return { zip, date, distance, stopKey, geometry, ingest, aggregate, mergedDemand, validate, graph, connected, stats, optimize, diagnose, assignVehicles, currentGroups, vehiclePool, vehicleCode, channel, fillEmpty, feasibility, hanLine, hanSource, riverCompatible, inPolygon };
 
 }
 if (typeof module !== 'undefined') module.exports = createEngine();

@@ -7,7 +7,7 @@ const XLSX = require('./vendor/xlsx.full.min.js');
 const testTile=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=','base64');
 const vworldPattern=/https:\/\/(?:xdworld|api)\.vworld\.kr\//;
 async function checkBasemaps(browser){
- const ctx=await browser.newContext(),p=await ctx.newPage(),requests=[],errors=[];
+ const ctx=await browser.newContext({viewport:{width:1440,height:1000}}),p=await ctx.newPage(),requests=[],errors=[];
  let failed=false;
  await ctx.route(vworldPattern,route=>failed?route.abort():route.fulfill({status:200,contentType:'image/png',body:testTile}));
  p.on('request',r=>requests.push(r.url()));p.on('pageerror',e=>errors.push(e.message));
@@ -15,7 +15,7 @@ async function checkBasemaps(browser){
  assert.equal(await p.inputValue('#baseMap'),'vworld');
  assert.equal(await p.locator('h1').innerText(),'Meatbox_Delivery Zones');
  assert.ok((await p.title()).startsWith('MFC 권역 작업'));
- assert.ok(await p.locator('.pagehead p').innerText().then(t=>t==='미트박스 전용차량의 효율을 살리기 위한 권역을 설계해보세요.'));
+ assert.equal(await p.locator('.pagehead .workspace-info p').textContent(),'미트박스 전용차량의 효율을 살리기 위한 권역을 설계해보세요.');
  assert.equal(await p.locator('#intro h2').innerText(),'미트박스 최적의 배송 권역을 설계해보세요');
  assert.equal(await p.locator('#closeIntroBtn').innerText(),'닫기');assert.equal(await p.locator('#demoBtn').count(),0);assert.equal(await p.locator('#intro .footnote').count(),0);
  const typography=await p.evaluate(()=>({body:parseFloat(getComputedStyle(document.body).fontSize),popup:parseFloat(getComputedStyle(document.querySelector('#intro h2')).fontSize),hint:parseFloat(getComputedStyle(document.querySelector('.hint')).fontSize)}));
@@ -57,9 +57,12 @@ async function checkBasemaps(browser){
     await page.goto(process.env.TEST_URL || 'http://localhost:3000');
     await page.screenshot({path:'.test-output/initial.png',fullPage:true});
     await page.evaluate(()=>demoData());await idle();
-    assert.equal(await page.evaluate(()=>Object.keys(agg.demand).length),41);
+    // 3.4: demo now carries 배송구분/차량코드 columns; 5 zones are OLS-only and leave dedicated demand.
+    assert.equal(await page.evaluate(()=>Object.keys(agg.demand).length),36);assert.equal(await page.evaluate(()=>Object.keys(agg.ols).length),35);assert.equal(await page.evaluate(()=>new Set([...Object.keys(agg.demand),...Object.keys(agg.ols)]).size),41);assert.ok(await page.evaluate(()=>agg.hasChannel&&agg.hasVehicle&&Object.keys(agg.currentVehicle).length===36));
     await page.click('#runBtn');await idle();
     assert.equal(await page.evaluate(()=>diagnostics.unassigned.length),0);
+    // Edit checks below need a group with a known Han side at index 0; demo grid straddles the river line.
+    await page.evaluate(()=>{const i=groups.findIndex(g=>g.kind!=='ols'&&g.zips.length&&g.zips.every(z=>geo.zones[z].river!=='unknown'));if(i>0){[groups[0],groups[i]]=[groups[i],groups[0]];render(true);}});
     const original=await page.evaluate(()=>JSON.stringify(groups));
     await page.click('[data-action="lock"][data-i="0"]');
     const locked=await page.evaluate(()=>JSON.stringify(groups[0]));
@@ -84,7 +87,7 @@ async function checkBasemaps(browser){
     await page.selectOption('#displayMode','sum');assert.equal(await page.inputValue('#basis'),priorBasis);assert.ok(await page.locator('#boxLabel').innerText().then(s=>s.includes('합계')));await page.selectOption('#displayMode','avg');
     await page.click('#scopeBtn');await page.locator('[data-city-index="0"]').check();await page.click('#modalAction2');assert.equal(await page.evaluate(()=>operationScope.size),48);
     await page.click('#fillEmptyBtn');await idle();assert.ok(await page.evaluate(()=>groups.flatMap(g=>g.zips).some(z=>!agg.demand[z])));assert.equal(await page.evaluate(()=>agg.avgBox),priorAvg);
-    assert.equal(await page.evaluate(()=>{const z=groups.flatMap(g=>g.zips).find(z=>!agg.demand[z]);return style(z).fillOpacity<.4}),true);
+    assert.equal(await page.evaluate(()=>{const z=groups.filter(g=>g.kind!=='ols').flatMap(g=>g.zips).find(z=>!agg.demand[z]&&!agg.ols[z]);return style(z).fillOpacity<.4}),true);
     await page.click('[data-action="edit"][data-i="0"]');const core=await page.evaluate(()=>groups[0].zips[0]);await page.fill('#editZips',core);await page.click('#coreBtn');await page.click('#removeZipsBtn');assert.equal(await page.evaluate(z=>groups[0].zips.includes(z),core),true);await page.click('#endEditBtn');
     const preserved=await page.evaluate(()=>JSON.stringify(groups));await page.click('#runBtn');await idle();assert.equal(await page.evaluate(()=>JSON.stringify(groups)),preserved);
     await page.fill('#vehicleCap','1400');await page.check('#weightOn');await page.selectOption('#planPolicy','rebuild');await page.click('#runBtn');await idle();assert.equal(await page.evaluate(z=>groups[0].core.includes(z),core),true);await page.uncheck('#weightOn');
@@ -98,12 +101,13 @@ async function checkBasemaps(browser){
     await page.click('#calendarBtn');await page.click('[data-day-preset="none"]');await page.click('[data-day="2026-09-02"]');await page.click('#modalAction0');await idle();
     assert.deepEqual(await page.evaluate(()=>agg.dates),['2026-09-02']);
     const planEvent=page.waitForEvent('download');await page.click('#savePlanBtn');const plan=await planEvent;await plan.saveAs('.test-output/plan.json');
-    const saved=JSON.parse(fs.readFileSync('.test-output/plan.json','utf8'));assert.equal(saved.version,3);assert.ok(!('records' in saved));
+    const saved=JSON.parse(fs.readFileSync('.test-output/plan.json','utf8'));assert.equal(saved.version,4);assert.ok(!('records' in saved));assert.deepEqual(saved.fleet.pool.slice(0,2),['Z001','Z002']);assert.ok(saved.groups.every(g=>['own','ols'].includes(g.kind)));assert.ok(saved.groups.some(g=>/^Z\d{3}$/.test(g.code)));
     await page.click('#newGroupBtn');await page.setInputFiles('#planInput','.test-output/plan.json');await idle();
     assert.equal(await page.evaluate(()=>groups.length),saved.groups.length);
     const exportEvent=page.waitForEvent('download');await page.click('#exportBtn');const out=await exportEvent;await out.saveAs('.test-output/export.xlsx');await idle();
-    const wb=XLSX.read(fs.readFileSync('.test-output/export.xlsx'),{type:'buffer'});assert.deepEqual(wb.SheetNames,['권역요약','우편번호배정','일별부하','데이터오류','설정']);
-    assert.equal(XLSX.utils.sheet_to_json(wb.Sheets['우편번호배정']).length,48);
+    const wb=XLSX.read(fs.readFileSync('.test-output/export.xlsx'),{type:'buffer'});assert.deepEqual(wb.SheetNames,['권역요약','우편번호배정','일별부하','데이터오류','전용차현황','설정']);
+    const assigned=XLSX.utils.sheet_to_json(wb.Sheets['우편번호배정']);assert.equal(assigned.length,48);assert.ok(assigned.every(r=>['전용차','OLS','미배정'].includes(r['구분'])));assert.ok(assigned.some(r=>/^Z\d{3}$/.test(r['현행차량코드'])));
+    assert.equal(XLSX.utils.sheet_to_json(wb.Sheets['전용차현황']).length,56);
     await page.screenshot({path:'.test-output/demo.png',fullPage:true});
     await page.setViewportSize({width:390,height:844});await page.screenshot({path:'.test-output/mobile.png',fullPage:true});
     assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1));
@@ -129,7 +133,7 @@ async function checkBasemaps(browser){
     assert.deepEqual(errors,[]);assert.deepEqual(outbound,[]);
     // No network access is needed to execute the exported single-file version.
     const offline=await browser.newContext({offline:true});const local=await offline.newPage();local.on('dialog',d=>d.accept());
-    await local.goto('file://'+process.cwd()+'/dist/MFC_Delivery_Zones_3.2.html');
+    await local.goto('file://'+process.cwd()+'/dist/MFC_Delivery_Zones_3.4.html');
     await local.selectOption('#baseMap','none');await local.click('#closeIntroBtn');assert.equal(await local.evaluate(()=>agg),null);await local.evaluate(()=>demoData());
     await local.waitForFunction(()=>document.querySelector('#busy').classList.contains('hidden'));
     await local.click('#runBtn');await local.waitForFunction(()=>document.querySelector('#busy').classList.contains('hidden'));
